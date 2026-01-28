@@ -1,0 +1,237 @@
+module FC_layer #(
+    parameter NODE   = 784,    
+    parameter N_NODE = 128,     
+    parameter INPUT  = 8,
+    parameter WEIGHT = 8,
+    parameter CORE   = 8,
+    parameter CORE_RESULT  = INPUT + WEIGHT + $clog2(CORE),      // 19bit
+    parameter ACC_RESULT   = INPUT + WEIGHT + $clog2(NODE)       // 26bit
+) (
+    input                            clk,
+    input                            rst,
+    input                            run, 
+    input                            run_after,             
+    input signed [INPUT-1:0]         input_data,    
+    input                            input_valid,   
+    input signed [WEIGHT-1:0]        weight_data,   
+    input                            weight_valid,  
+    output                           r_request, 
+    output                           done_read,             
+    output                           done_write,         
+    output reg signed [ACC_RESULT-1:0] one_node_result,       
+    output reg                       one_node_result_valid  
+);  
+
+    localparam IDLE         = 3'b000;
+    localparam DATA_FLOW    = 3'b001; 
+    localparam CALC_IN_CORE = 3'b010; 
+    localparam ACC_DATA     = 3'b011; 
+    localparam DONE_ONE     = 3'b100; 
+    localparam MEM_WR       = 3'b101; 
+    localparam FC_DONE      = 3'b110; 
+
+    reg [2:0] c_state, n_state;
+
+    localparam CNT_BIT_CORE  = $clog2(CORE + 1);
+    localparam CNT_BIT_ACC   = $clog2((NODE/CORE) + 1);
+    localparam CNT_BIT_WRITE = $clog2(N_NODE + 1);
+
+    reg [CNT_BIT_CORE-1:0]  data_cnt;       
+    reg [CNT_BIT_ACC-1:0]   acc_cnt;        
+    reg [CNT_BIT_WRITE-1:0] write_cnt;   
+
+    reg signed [ACC_RESULT-1:0] one_node;           
+
+    wire signed [CORE_RESULT-1:0] o_core_data;
+    wire                          o_core_valid;
+
+    reg signed [INPUT-1:0]  input_data_reg;
+    reg                     input_valid_reg;
+    reg signed [WEIGHT-1:0] weight_data_reg;
+    reg                     weight_valid_reg;
+
+    reg run_forward;
+    reg run_back;
+    reg first_run;
+
+    
+    always @(posedge clk or negedge rst) begin
+        if(!rst) first_run <= 1'b1;
+        else if(c_state == FC_DONE) first_run <= 1'b0;
+    end
+
+    // run_forward 래치 (FC_DONE 전까지 유지)
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            run_forward <= 0;
+        end else if (run) begin
+            run_forward <= 1;
+        end else if(c_state == FC_DONE) begin 
+            run_forward <= 0;
+        end
+    end
+
+    // run_back 래치 (FC_DONE 전까지 유지)
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            run_back <= 0;
+        end else if (run_after) begin
+            run_back <= 1;
+        end else if(c_state == FC_DONE) begin
+            run_back <= 0;
+        end
+    end
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            input_data_reg  <= 0;
+            input_valid_reg <= 0;
+        end else begin
+            input_data_reg  <= input_data;
+            input_valid_reg <= input_valid;
+        end
+    end
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            weight_data_reg  <= 0;
+            weight_valid_reg <= 0;
+        end else begin
+            weight_data_reg  <= weight_data;
+            weight_valid_reg <= weight_valid;
+        end
+    end
+
+    wire   data_valid_comb; 
+    assign data_valid_comb = input_valid_reg & weight_valid_reg; 
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            c_state <= IDLE;
+        end else begin
+            c_state <= n_state;
+        end
+    end
+
+    //State Machine Start Condition
+    always @(*) begin
+        n_state = c_state; 
+        case (c_state)
+            IDLE: begin
+                if ( run_forward && (first_run || run_back) ) 
+                    n_state = DATA_FLOW;
+            end
+            DATA_FLOW: begin
+                if (data_cnt == CORE) n_state = CALC_IN_CORE; 
+            end 
+            CALC_IN_CORE: begin
+                if (o_core_valid) n_state = ACC_DATA; 
+            end
+            ACC_DATA: begin 
+                if (acc_cnt == (NODE/CORE)) n_state = DONE_ONE;
+                else                        n_state = DATA_FLOW;  
+            end 
+            DONE_ONE: begin
+                n_state = MEM_WR; 
+            end
+            MEM_WR : begin 
+                if (write_cnt == N_NODE-1) n_state = FC_DONE; 
+                else                     n_state = DATA_FLOW;
+            end
+            FC_DONE : begin 
+                n_state = IDLE;
+            end
+        endcase
+    end
+
+    // req_cnt Logic
+    reg [3:0] req_cnt;
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            req_cnt <= 0;
+        end else if (c_state == DATA_FLOW && req_cnt < CORE) begin
+            req_cnt <= req_cnt + 1;
+        end else if (c_state != DATA_FLOW) begin
+            req_cnt <= 0;
+        end
+    end
+
+    assign r_request = (c_state == DATA_FLOW) && (req_cnt < CORE);
+    wire i_data_valid_comb = input_valid && weight_valid;
+ 
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            data_cnt <= 0;
+        end else if (i_data_valid_comb && (data_cnt < CORE)) begin
+            data_cnt <= data_cnt + 1;  
+        end else if (c_state != DATA_FLOW) begin 
+            data_cnt <= 0;
+        end
+    end
+   
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            one_node <= 0; 
+            acc_cnt <= 0;  
+        end else begin
+            if ((c_state == CALC_IN_CORE) && o_core_valid) begin 
+                one_node <= one_node + o_core_data;  
+                acc_cnt <= acc_cnt + 1;
+            end 
+            else if (c_state == DONE_ONE) begin
+                one_node <= 0;      
+                acc_cnt <= 0;   
+            end
+        end
+    end
+
+    reg [ACC_RESULT-1:0] one_node_reg;
+    
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            one_node_reg <= 0;
+        end else if (c_state == ACC_DATA && acc_cnt == (NODE/CORE)) begin
+            one_node_reg <= one_node; 
+        end else if(c_state == MEM_WR) begin
+            one_node_reg <= 0;
+        end
+    end
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            one_node_result <= 0;
+            one_node_result_valid <= 0;
+        end else if(c_state == MEM_WR) begin
+            one_node_result <= one_node_reg;
+            one_node_result_valid <= 1'b1; 
+        end else begin
+            one_node_result_valid <= 0;
+        end
+    end
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            write_cnt <= 0;
+        end else if (c_state == MEM_WR) begin
+            write_cnt <= write_cnt + 1;
+        end else if(c_state == FC_DONE) begin 
+            write_cnt <= 0;
+        end
+    end
+
+    // Handshake logic
+    assign done_read     = (n_state == FC_DONE || (n_state == IDLE && !run_forward)); 
+    assign done_write    = (c_state == FC_DONE); 
+ 
+    core #(
+        .NODE(NODE), .INPUT(INPUT), .WEIGHT(WEIGHT), .CORE(CORE)
+    ) u0 (
+        .clk(clk),
+        .rst(rst),
+        .i_input(input_data_reg),   
+        .i_weight(weight_data_reg),  
+        .i_data_valid(data_valid_comb),
+        .o_core_data(o_core_data),
+        .o_core_valid(o_core_valid)
+    );
+endmodule
